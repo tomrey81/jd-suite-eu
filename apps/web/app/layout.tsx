@@ -18,9 +18,9 @@ const dmSans = DM_Sans({
 });
 
 export const metadata: Metadata = {
-  title: 'JD Suite',
+  title: 'JD Suite EU',
   description:
-    'Production-grade job description management platform. Create, analyse, evaluate, and export JDs aligned to EU Pay Transparency Directive 2023/970.',
+    'Production-grade job description management platform. Create, analyse, evaluate, and export JDs aligned to EU Pay Transparency Directive 2023/970. Combined governance console + org intelligence platform.',
   robots: 'noindex, nofollow',
 };
 

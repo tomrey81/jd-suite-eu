@@ -26,6 +26,11 @@ export function taskShareUrl(taskId: string): string {
   return `${o}/command-center?task=${taskId}`;
 }
 
+export function sonificationReceiverUrl(): string {
+  const o = origin();
+  return `${o}/sonification/receiver`;
+}
+
 export function platformMobileUrl(): string {
   const o = origin();
   return `${o}/welcome?source=qr`;
