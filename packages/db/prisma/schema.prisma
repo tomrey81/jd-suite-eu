@@ -1,0 +1,1356 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Organisation ─────────────────────────────────────────────────────────────
+
+model Organisation {
+  id        String   @id @default(uuid())
+  name      String
+  plan      String   @default("free")
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships          Membership[]
+  jobDescriptions      JobDescription[]
+  templates            Template[]
+  orgCharts            OrgChart[]
+  batchExports         BatchExport[]
+  processes            Process[]
+  processRoles         ProcessRole[]
+  payGroups            PayGroup[]
+  jobFamilies          JobFamily[]
+  jobArchitectureSlots JobArchitectureSlot[]
+
+  @@map("organisations")
+}
+
+// ── User ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(uuid())
+  email           String    @unique
+  name            String?
+  firstName       String?
+  lastName        String?
+  country         String?   // ISO-2 code, e.g. "PL"
+  jobFunction     String?   // free text, e.g. "Total Rewards"
+  dataConsentAt   DateTime? // GDPR / data processing acceptance
+  marketingOptIn    Boolean   @default(false)
+  newsletterOptIn   Boolean   @default(false)
+  tosAcceptedAt     DateTime?
+  privacyAcceptedAt DateTime?
+  isPlatformAdmin Boolean   @default(false) // global super-admin (you)
+  passwordHash    String?
+  emailVerified   DateTime?
+  image           String?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Phase 3 — user preferences
+  preferredLanguage String? // ISO-639-1 code, e.g. "pl" — synced from settings on save
+
+  memberships      Membership[]
+  ownedJDs         JobDescription[] @relation("JDOwner")
+  jdVersions       JDVersion[]
+  comments         JDComment[]
+  createdTokens    GuestToken[]     @relation("TokenCreator")
+  resolvedComments JDComment[]      @relation("CommentResolver")
+  createdTemplates Template[]
+  exports          Export[]
+  batchExports     BatchExport[]
+  evalResults      EvalResult[]
+  accounts         Account[]
+  sessions         Session[]
+  accessCodeUses   AccessCodeUse[]
+  authTokens       AuthToken[]
+
+  // Phase 1 — Ultra additions
+  aiUsageLogs       AiUsageLog[]
+  axiomeraRunsCreated AxiomeraRun[] @relation("AxiomeraRunCreator")
+  jdqRunsCreated    JdqRun[]      @relation("JdqRunCreator")
+  jdqProgramsCreated JdqProgram[] @relation("JdqProgramCreator")
+  jdqProgramsSealed  JdqProgram[] @relation("JdqProgramSealer")
+
+  // Phase 3 — Companion
+  companionRequests CompanionRequest[]
+
+  @@map("users")
+}
+
+// Single table for password-reset and magic-link tokens.
+// Raw token never stored — only SHA-256 hash. One-time-use via usedAt.
+model AuthToken {
+  id         String    @id
+  kind       String    // 'reset' | 'magic'
+  tokenHash  String    @unique
+  email      String
+  userId     String?
+  expiresAt  DateTime
+  usedAt     DateTime?
+  issuedIp   String?
+  createdAt  DateTime  @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([kind])
+  @@index([email])
+  @@index([expiresAt])
+  @@map("auth_tokens")
+}
+
+// ── Access Codes (rotatable invitation codes) ────────────────────────────────
+
+model AccessCode {
+  id          String    @id @default(uuid())
+  code        String    @unique
+  label       String?   // e.g. "Beta-Wave-1", "Conference-Lisbon"
+  maxUses     Int?      // null = unlimited
+  usesCount   Int       @default(0)
+  expiresAt   DateTime?
+  active      Boolean   @default(true)
+  createdById String?
+  createdAt   DateTime  @default(now())
+
+  uses AccessCodeUse[]
+
+  @@index([code])
+  @@map("access_codes")
+}
+
+// ── JD Checkout / Check-in (tamper detection) ──────────────────────────────
+//
+// When an admin or user "checks out" a JD for editing or external review,
+// we snapshot a SHA-256 hash of the JD content. On check-in we recompute
+// the hash and compare; mismatch → tamperFlag = true, requires admin review.
+
+enum JDCheckoutStatus {
+  CHECKED_OUT
+  CHECKED_IN
+  ABANDONED
+}
+
+model JDCheckout {
+  id             String           @id @default(uuid())
+  jdId           String
+  actorId        String?
+  hashAlgo       String           @default("sha256")
+  checkoutHash   String           // hash at checkout time
+  checkinHash    String?          // hash at checkin time
+  snapshot       Json             // full data snapshot at checkout
+  status         JDCheckoutStatus @default(CHECKED_OUT)
+  tamperFlag     Boolean          @default(false)
+  checkedOutAt   DateTime         @default(now())
+  checkedInAt    DateTime?
+  note           String?
+
+  @@index([jdId])
+  @@index([status])
+  @@map("jd_checkouts")
+}
+
+// ── Admin (panel-level) audit log ──────────────────────────────────────────
+// Separate from JDVersion (which logs JD content edits). This logs panel
+// actions: user role changes, org renames, code rotations, etc.
+
+model AdminAuditLog {
+  id        String   @id @default(uuid())
+  actorId   String?
+  actorRole String   @default("admin")
+  action    String   // e.g. "user_role_changed", "access_code_created"
+  detail    Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([action])
+  @@map("admin_audit_log")
+}
+
+// ── Rate limit (cross-instance bucket) ─────────────────────────────────────
+// Used by login + admin write endpoints to enforce limits across all
+// serverless instances (in-memory was per-instance only). Bucket key
+// is e.g. `login:1.2.3.4`. resetAt = first request time + window.
+
+model RateLimitBucket {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+
+  @@index([resetAt])
+  @@map("rate_limit_buckets")
+}
+
+model AccessCodeUse {
+  id           String     @id @default(uuid())
+  accessCodeId String
+  userId       String
+  usedAt       DateTime   @default(now())
+
+  accessCode AccessCode @relation(fields: [accessCodeId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([accessCodeId, userId])
+  @@map("access_code_uses")
+}
+
+// ── Auth.js Models ───────────────────────────────────────────────────────────
+
+model Account {
+  id                String  @id @default(uuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ── Membership (User <-> Organisation) ───────────────────────────────────────
+
+enum OrgRole {
+  ADMIN
+  OWNER
+  MEMBER
+}
+
+model Membership {
+  id     String  @id @default(uuid())
+  userId String
+  orgId  String
+  role   OrgRole @default(MEMBER)
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org  Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+  @@map("memberships")
+}
+
+// ── Job Description ──────────────────────────────────────────────────────────
+
+enum JDStatus {
+  DRAFT
+  UNDER_REVISION
+  APPROVED
+  ARCHIVED
+}
+
+model JobDescription {
+  id               String    @id @default(uuid())
+  orgId            String
+  ownerId          String
+  templateId       String?
+  data             Json      @default("{}")
+  status           JDStatus  @default(DRAFT)
+  jobTitle         String    @default("")
+  jobCode          String?
+  orgUnit          String?
+  folder           String?
+  sortOrder        Int       @default(0)
+  archivedAt       DateTime?
+  duplicatedFromId String?
+  careerFamily     String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  org      Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  owner    User         @relation("JDOwner", fields: [ownerId], references: [id])
+  template Template?    @relation(fields: [templateId], references: [id])
+
+  versions         JDVersion[]
+  comments         JDComment[]
+  guestTokens      GuestToken[]
+  evalResults      EvalResult[]
+  exports          Export[]
+  payGroupMembers  PayGroupMember[]
+  architectureSlot JobArchitectureSlot?
+
+  // Phase 1 — Ultra additions (Axiomera + JDQ)
+  axiomeraRuns AxiomeraRun[]
+  jdqRuns      JdqRun[]
+  aiUsageLogs  AiUsageLog[]
+
+  // Sources Intelligence Engine
+  importedPostings ImportedJobPosting[]
+
+  @@index([orgId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([folder])
+  @@index([careerFamily])
+  @@index([archivedAt])
+  @@map("job_descriptions")
+}
+
+// ── JD Version (Immutable Audit Trail) ───────────────────────────────────────
+
+enum ChangeType {
+  FIELD_EDIT
+  STATUS_CHANGE
+  COMMENT
+  IMPORT
+  AI_ASSIST
+  EVALUATION
+  EXPORT
+}
+
+model JDVersion {
+  id           String     @id @default(uuid())
+  jdId         String
+  authorId     String?
+  authorType   String     @default("USER") // USER | GUEST
+  data         Json?      // Full JD snapshot (optional, for major changes)
+  changeType   ChangeType
+  fieldChanged String?
+  oldValue     String?
+  newValue     String?
+  note         String?
+  timestamp    DateTime   @default(now())
+
+  jd     JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  author User?          @relation(fields: [authorId], references: [id])
+
+  @@index([jdId])
+  @@index([timestamp])
+  @@map("jd_versions")
+}
+
+// ── JD Comment ───────────────────────────────────────────────────────────────
+
+model JDComment {
+  id           String    @id @default(uuid())
+  jdId         String
+  authorId     String?
+  authorType   String    @default("USER") // USER | GUEST
+  authorEmail  String?   // For guest comments
+  content      String
+  fieldId      String?   // Which field the comment is about (nullable = general)
+  resolvedAt   DateTime?
+  resolvedById String?
+  createdAt    DateTime  @default(now())
+
+  jd         JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  author     User?          @relation(fields: [authorId], references: [id])
+  resolvedBy User?          @relation("CommentResolver", fields: [resolvedById], references: [id])
+
+  @@index([jdId])
+  @@map("jd_comments")
+}
+
+// ── Guest Token ──────────────────────────────────────────────────────────────
+
+model GuestToken {
+  id          String    @id @default(uuid())
+  jdId        String
+  createdById String
+  email       String
+  role        String    @default("VIEWER") // VIEWER | REVIEWER
+  token       String    @unique @default(uuid())
+  expiresAt   DateTime
+  usedAt      DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  jd        JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  createdBy User           @relation("TokenCreator", fields: [createdById], references: [id])
+
+  @@index([token])
+  @@index([jdId])
+  @@map("guest_tokens")
+}
+
+// ── Template ─────────────────────────────────────────────────────────────────
+
+model Template {
+  id          String   @id @default(uuid())
+  orgId       String?  // null = system template
+  name        String
+  purpose     String   @default("general")
+  description String   @default("")
+  sections    Json     // TemplateSection[]
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  createdById String?
+
+  org       Organisation?    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdBy User?            @relation(fields: [createdById], references: [id])
+  jds       JobDescription[]
+
+  @@index([orgId])
+  @@map("templates")
+}
+
+// ── Evaluation Result ────────────────────────────────────────────────────────
+
+model EvalResult {
+  id           String   @id @default(uuid())
+  jdId         String
+  version      Int      @default(1)
+  criteria     Json     // CriterionResult[]
+  overallScore Int      @default(0)
+  createdAt    DateTime @default(now())
+  createdById  String?
+
+  jd        JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  createdBy User?          @relation(fields: [createdById], references: [id])
+
+  @@index([jdId])
+  @@map("eval_results")
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+
+model Export {
+  id          String   @id @default(uuid())
+  jdId        String
+  userId      String
+  format      String   // TXT | PDF | DOCX | MD | JSON
+  downloadUrl String?
+  createdAt   DateTime @default(now())
+
+  jd   JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  user User           @relation(fields: [userId], references: [id])
+
+  @@map("exports")
+}
+
+// ── Batch Export ─────────────────────────────────────────────────────────────
+
+model BatchExport {
+  id          String   @id @default(uuid())
+  orgId       String
+  userId      String
+  jdIds       Json     // string[]
+  format      String
+  downloadUrl String?
+  createdAt   DateTime @default(now())
+
+  org  Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id])
+
+  @@map("batch_exports")
+}
+
+// ── Org Chart ────────────────────────────────────────────────────────────────
+
+model OrgChart {
+  id        String   @id @default(uuid())
+  orgId     String
+  nodes     Json     @default("[]") // positions, relationships
+  updatedAt DateTime @updatedAt
+
+  org Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId])
+  @@map("org_charts")
+}
+
+// ── Process Intelligence (RASCI) ─────────────────────────────────────────────
+
+model Process {
+  id        String   @id @default(uuid())
+  orgId     String
+  step      String
+  rasci     Json     @default("{}") // { [role]: "R"|"A"|"S"|"C"|"I" }
+  confirmed Boolean  @default(false)
+  note      String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  org Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("processes")
+}
+
+model ProcessRole {
+  id    String @id @default(uuid())
+  orgId String
+  name  String
+
+  org Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, name])
+  @@map("process_roles")
+}
+
+// ── Pay Groups (EUPTD 2023/970 Article 4) ────────────────────────────────────
+
+model PayGroup {
+  id          String   @id @default(uuid())
+  orgId       String
+  name        String   // e.g. "Pay Group A", "Senior Technical"
+  description String?
+  color       String   @default("#8A7560") // for visual distinction in matrix
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org      Organisation       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  members  PayGroupMember[]
+  auditLog PayGroupAuditLog[]
+
+  @@index([orgId])
+  @@map("pay_groups")
+}
+
+model PayGroupMember {
+  id        String   @id @default(uuid())
+  groupId   String
+  jdId      String
+  addedById String?
+  addedAt   DateTime @default(now())
+
+  group PayGroup       @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  jd    JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, jdId])
+  @@index([groupId])
+  @@index([jdId])
+  @@map("pay_group_members")
+}
+
+// Every action on a pay group is logged with a mandatory comment (Article 4 compliance)
+model PayGroupAuditLog {
+  id        String   @id @default(uuid())
+  groupId   String
+  jdId      String?  // Which JD was affected (null = group-level action)
+  action    String   // GROUP_CREATED | JD_ADDED | JD_MOVED | JD_REMOVED | GROUP_RENAMED | AI_GROUPED
+  fromGroup String?  // Previous group name (for moves)
+  toGroup   String?  // New group name (for moves)
+  comment   String   // MANDATORY comment explaining reason for change
+  authorId  String?
+  timestamp DateTime @default(now())
+
+  group PayGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+  @@index([timestamp])
+  @@map("pay_group_audit_log")
+}
+
+// ── Job Architecture Matrix ────────────────────────────────────────────────────
+
+model JobFamily {
+  id          String   @id @default(uuid())
+  orgId       String
+  name        String   // e.g. "Technology", "Sales", "Operations", "Finance"
+  description String?
+  color       String   @default("#8A7560")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  org   Organisation          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  slots JobArchitectureSlot[]
+
+  @@index([orgId])
+  @@map("job_families")
+}
+
+// ── PMOA (Process Mapping & Org Architecture) ───────────────────────────────
+
+model PmoaDocument {
+  id              String   @id
+  orgId           String
+  uploaderId      String?
+  name            String
+  mime            String?
+  sizeBytes       Int?
+  fingerprint     String?
+  rawText         String?
+  pages           Int?
+  validityFlag    String   @default("recent")
+  validityNote    String?
+  documentOwnerId String?
+  parseStatus     String   @default("parsing")
+  parseError      String?
+  ocrConfidence   Float?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now())
+
+  @@index([orgId])
+  @@index([validityFlag])
+  @@map("pmoa_documents")
+}
+
+model PmoaDepartment {
+  id                String   @id
+  orgId             String
+  name              String
+  parentId          String?
+  headPositionId    String?
+  sourceDocumentIds String[] @default([])
+  createdAt         DateTime @default(now())
+
+  @@index([orgId])
+  @@map("pmoa_departments")
+}
+
+model PmoaPosition {
+  id                String   @id
+  orgId             String
+  departmentId      String?
+  name              String
+  positionNumber    String?
+  reportsToId       String?
+  currentHolderName String?
+  vacancy           Boolean  @default(false)
+  spanOfControl     Int      @default(0)
+  linkedJdId        String?
+  sourceDocumentIds String[] @default([])
+  createdAt         DateTime @default(now())
+
+  @@index([orgId])
+  @@index([reportsToId])
+  @@index([departmentId])
+  @@map("pmoa_positions")
+}
+
+model PmoaAssignment {
+  id               String    @id
+  orgId            String
+  positionId       String
+  personName       String
+  kind             String    @default("permanent")
+  splitAllocations Json?
+  validFrom        DateTime? @db.Date
+  validUntil       DateTime? @db.Date
+  createdAt        DateTime  @default(now())
+
+  @@index([positionId])
+  @@map("pmoa_assignments")
+}
+
+model PmoaProcess {
+  id                String   @id
+  orgId             String
+  name              String
+  description       String?
+  ownerPositionId   String?
+  validityFlag      String   @default("recent")
+  sourceDocumentIds String[] @default([])
+  bpmn              Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now())
+
+  @@index([orgId])
+  @@map("pmoa_processes")
+}
+
+model PmoaProcessStep {
+  id               String   @id
+  processId        String
+  stepOrder        Int      @default(0)
+  name             String
+  kind             String   @default("task")
+  actorPositionId  String?
+  actorRoleName    String?
+  slaDescription   String?
+  sourceDocumentId String?
+  sourcePage       Int?
+  outgoing         Json?    // [{ targetStepId, label }] — supports branches
+  createdAt        DateTime @default(now())
+
+  @@index([processId])
+  @@map("pmoa_process_steps")
+}
+
+model PmoaRasciCell {
+  id             String   @id
+  stepId         String
+  positionId     String?
+  roleName       String?
+  letter         String
+  manualOverride Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([stepId])
+  @@map("pmoa_rasci_cells")
+}
+
+model PmoaIssue {
+  id              String   @id
+  orgId           String
+  severity        String
+  kind            String
+  title           String
+  rationale       String?
+  suggestedAction String?
+  affectedNodeIds Json?
+  status          String   @default("open")
+  statusReason    String?
+  assigneeId      String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now())
+
+  @@index([orgId])
+  @@index([status])
+  @@map("pmoa_issues")
+}
+
+// ── EUPTD Readiness Self-Assessment ─────────────────────────────────────────
+
+model EuptdReadinessResponse {
+  id             String    @id
+  orgId          String
+  itemId         String
+  answer         String    // 'yes' | 'partial' | 'no' | 'na'
+  note           String?
+  answeredById   String?
+  assignedToId   String?
+  reviewBy       DateTime?
+  answeredAt     DateTime  @default(now())
+  updatedAt      DateTime  @default(now())
+
+  @@unique([orgId, itemId])
+  @@index([orgId])
+  @@index([assignedToId])
+  @@map("euptd_readiness_responses")
+}
+
+// ── Photos table (legacy / unrelated app sharing this DB; preserved here so prisma db push doesn't drop it)
+model Photo {
+  id            String    @id
+  url           String?
+  author        String?
+  tags          Json?
+  timestamp     String?
+  frame_style   String?
+  reactions     Json?
+  comments      Json?
+  hidden        Boolean?
+  drive_file_id String?
+  created_at    DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@map("photos")
+}
+
+model JobArchitectureSlot {
+  id       String   @id @default(uuid())
+  orgId    String
+  familyId String
+  jdId     String   @unique // One JD per slot in the matrix
+  level    Int      // Grade level 1-20 (column in matrix)
+  note     String?  // Optional placement note
+  placedBy String?
+  placedAt DateTime @default(now())
+
+  org    Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  family JobFamily      @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  jd     JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([familyId])
+  @@map("job_architecture_slots")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 1 — Ultra additions: AI usage logging + Axiomera/JDQ engines
+// All additive. None replace or modify existing Pro models.
+// Default behavior unchanged when feature flags are OFF.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── AI Usage Log (insert-only, populated by lib/ai/call-ai.ts) ───────────────
+
+model AiUsageLog {
+  id                   String   @id @default(uuid())
+  operation            String   // e.g. "jd.evaluate.axiomera"
+  modelId              String   // e.g. "claude-sonnet-4-6"
+  modelTier            String   // "haiku" | "sonnet" | "opus" | "embedding-small" | "embedding-large" | "deterministic"
+  promptVersion        String   // "v1.0.0"
+  orgId                String?
+  userId               String?
+  jdId                 String?
+  programId            String?  // links to JdqProgram if applicable
+  inputTokensEstimate  Int?
+  inputTokensActual    Int?
+  outputTokensEstimate Int?
+  outputTokensActual   Int?
+  estimatedCostUsd     Decimal  @db.Decimal(10, 6)
+  actualCostUsd        Decimal? @db.Decimal(10, 6)
+  cacheStatus          String   // "hit" | "miss" | "n/a"
+  cacheKey             String?
+  durationMs           Int?
+  status               String   // "ok" | "error" | "timeout" | "rate_limited"
+  errorMessage         String?
+  createdAt            DateTime @default(now())
+
+  // Optional FKs (SetNull on parent delete to preserve audit trail)
+  user User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  jd   JobDescription? @relation(fields: [jdId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt])
+  @@index([operation, createdAt])
+  @@index([userId])
+  @@index([jdId])
+  @@map("ai_usage_log")
+}
+
+// ── Axiomera Engine ──────────────────────────────────────────────────────────
+// Runs the full R/S/E/WC composite per Axiomera Whitepaper v1.0.
+
+model AxiomeraRun {
+  id                String   @id @default(uuid())
+  jdId              String
+  jdVersionId       String?  // optional link to a specific JDVersion snapshot
+  programId         String?  // optional sealed program reference (Phase 2)
+  engineVersion     String   @default("axiomera-v1.0")
+  promptVersionR    String   @default("v1.0.0")
+  promptVersionE    String   @default("v1.0.0")
+
+  // R — Responsibility (47.2%)
+  rPkt              Int      // points (140-635 per Table 12)
+  rZone             Int      // 1-9
+  rConfidence       Decimal  @db.Decimal(4, 3) // 0.000-1.000
+  rActiveKeys       Json     // string[] of active R-hypothesis keys
+  rEvidence         Json     // { [hypothesisKey]: quote }
+  rContradictions   Json     // string[] of detected contradictions
+
+  // S — Skills (33.3%)
+  sPkt              Int      // 50/90/150/230/333 per Table 14
+  sLevel            String   // "S1" | "S2" | "S3" | "S4" | "S5"
+  sSource           String   // "primary" | "esco" | "isco_median"
+  sEdu              Int?     // 1-5 if detected
+  sExp              Int?     // 1-5 if detected
+  sIscoCode         String?  // ISCO_2 if used for fallback
+
+  // E — Effort (19.5%)
+  ePkt              Int      // E_score × 430
+  eScore            Decimal  @db.Decimal(4, 3) // 0.000-1.000
+  cogScore          Decimal  @db.Decimal(5, 2) // 0.00-100.00
+  emoScore          Decimal  @db.Decimal(5, 2)
+  phyScore          Decimal  @db.Decimal(5, 2)
+  eConfidence       Decimal  @db.Decimal(4, 3)
+  eActiveKeys       Json     // string[]
+  eEvidence         Json     // { [key]: quote }
+
+  // WC — Working Conditions (separate compensation)
+  wcPkt             Int      // 50-350 per Table 20
+  wcLevel           String   // "W1" | "W2" | "W3" | "W4" | "W5"
+  wcIscoCode        String?
+
+  // Composite
+  totalRSE          Int      // R_pkt + S_pkt + E_pkt
+  grade             Int      // round((R+S+E)/50)
+  band              String   // "A1" | "A2" | ... | "E5"
+  ciGlobal          Decimal  @db.Decimal(4, 3)
+  contradictionFlag Boolean  @default(false)
+  needsReview       Boolean  @default(false)
+
+  // Audit
+  createdAt   DateTime @default(now())
+  createdById String?
+
+  jd        JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  createdBy User?          @relation("AxiomeraRunCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  program   JdqProgram?    @relation(fields: [programId], references: [id], onDelete: SetNull)
+  criterionScores AxiomeraCriterionScore[]
+  validationGates AxiomeraValidationGate[]
+
+  @@index([jdId, createdAt])
+  @@index([programId])
+  @@map("axiomera_runs")
+}
+
+// Per-dimension breakdown for reporting / drill-down.
+model AxiomeraCriterionScore {
+  id            String   @id @default(uuid())
+  runId         String
+  dimension     String   // "R" | "S" | "E_COG" | "E_EMO" | "E_PHY" | "WC"
+  rawScore      Decimal  @db.Decimal(8, 3)
+  normalizedScore Decimal? @db.Decimal(5, 2)
+  pointsContribution Int
+  weight        Decimal  @db.Decimal(4, 3)
+  notes         String?
+  createdAt     DateTime @default(now())
+
+  run AxiomeraRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("axiomera_criterion_scores")
+}
+
+// Validation gate results — tracks H1-H4 plus contradiction flags etc.
+model AxiomeraValidationGate {
+  id        String   @id @default(uuid())
+  runId     String
+  gateName  String   // "H1_COG_O*NET" | "H4_zone_differentiation" | "CI_global_threshold" | etc.
+  passed    Boolean
+  threshold Decimal? @db.Decimal(8, 4)
+  observed  Decimal? @db.Decimal(8, 4)
+  message   String?
+  createdAt DateTime @default(now())
+
+  run AxiomeraRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("axiomera_validation_gates")
+}
+
+// ── JDQ Quality Layer ────────────────────────────────────────────────────────
+// Faster, lighter-weight quality assessment. May be deterministic-only.
+
+model JdqRun {
+  id                  String   @id @default(uuid())
+  jdId                String
+  engineVersion       String   @default("jdq-v1.0")
+  structureCoverage   Decimal  @db.Decimal(5, 2) // 0-100
+  languageScore       Decimal  @db.Decimal(5, 2)
+  factorsScore        Decimal  @db.Decimal(5, 2)
+  decisionScore       Decimal  @db.Decimal(5, 2)
+  composite           Decimal  @db.Decimal(5, 2)
+  overallLight        String   // "green" | "amber" | "red"
+  weights             Json     // { structure, language, factors, decision }
+  findings            Json     // { activeBiasFlags, contradictions, missingFields, ... }
+  edgeCaseCodes       Json     // string[] e.g. ["EC-04", "EC-12"]
+  createdAt           DateTime @default(now())
+  createdById         String?
+
+  jd          JobDescription @relation(fields: [jdId], references: [id], onDelete: Cascade)
+  createdBy   User?          @relation("JdqRunCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  rHypotheses RHypothesisRecord[]
+  eHypotheses EHypothesisRecord[]
+  rZoneEstimates RZoneEstimate[]
+  eScoreSummaries EScoreSummary[]
+
+  @@index([jdId, createdAt])
+  @@map("jdq_runs")
+}
+
+model RHypothesisRecord {
+  id           String   @id @default(uuid())
+  jdqRunId     String
+  hypothesisKey String  // e.g. "no_prior_experience"
+  level        Int     // 1-3
+  active       Boolean
+  evidence     String?
+  createdAt    DateTime @default(now())
+
+  run JdqRun @relation(fields: [jdqRunId], references: [id], onDelete: Cascade)
+
+  @@index([jdqRunId])
+  @@index([hypothesisKey])
+  @@map("r_hypothesis_records")
+}
+
+model EHypothesisRecord {
+  id           String   @id @default(uuid())
+  jdqRunId     String
+  hypothesisKey String
+  dimension    String  // "COG" | "EMO" | "PHY"
+  hypothesisType String // "P" | "I"
+  active       Boolean
+  evidence     String?
+  createdAt    DateTime @default(now())
+
+  run JdqRun @relation(fields: [jdqRunId], references: [id], onDelete: Cascade)
+
+  @@index([jdqRunId])
+  @@index([hypothesisKey])
+  @@map("e_hypothesis_records")
+}
+
+model RZoneEstimate {
+  id            String   @id @default(uuid())
+  jdqRunId      String
+  weightedZone  Decimal  @db.Decimal(4, 2)
+  roundedZone   Int
+  rPoints       Int
+  confidence    String   // "high" | "medium" | "low"
+  rLevelMean    Decimal  @db.Decimal(4, 2)
+  createdAt     DateTime @default(now())
+
+  run JdqRun @relation(fields: [jdqRunId], references: [id], onDelete: Cascade)
+
+  @@index([jdqRunId])
+  @@map("r_zone_estimates")
+}
+
+model EScoreSummary {
+  id        String   @id @default(uuid())
+  jdqRunId  String
+  cog       Decimal  @db.Decimal(5, 2)
+  emo       Decimal  @db.Decimal(5, 2)
+  phy       Decimal  @db.Decimal(5, 2)
+  eScore    Decimal  @db.Decimal(4, 3)
+  ePkt      Int
+  confidence String  // "high" | "medium" | "low"
+  createdAt DateTime @default(now())
+
+  run JdqRun @relation(fields: [jdqRunId], references: [id], onDelete: Cascade)
+
+  @@index([jdqRunId])
+  @@map("e_score_summaries")
+}
+
+// ── JDQ Program (Sealed Programs — Phase 2 use; Phase 1 schema only) ─────────
+
+model JdqProgram {
+  id          String   @id @default(uuid())
+  orgId       String
+  name        String
+  description String?
+  weights     Json     // RSEWeights and JDQWeights
+  engineVersion String @default("axiomera-v1.0")
+  status      String   @default("DRAFT") // "DRAFT" | "SEALED" | "SUPERSEDED"
+  sealed      Boolean  @default(false)
+  sealedAt    DateTime?
+  sealedById  String?
+  supersededById String? // points to next version
+  versionNumber Int    @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdById String?
+
+  createdBy User?         @relation("JdqProgramCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  sealedBy  User?         @relation("JdqProgramSealer", fields: [sealedById], references: [id], onDelete: SetNull)
+  axiomeraRuns AxiomeraRun[]
+
+  @@index([orgId])
+  @@index([status])
+  @@map("jdq_programs")
+}
+
+// ── Approval Records (Phase 2 use; Phase 1 schema only) ──────────────────────
+
+model ApprovalRecord {
+  id                 String   @id @default(uuid())
+  jdId               String
+  jdVersionId        String?  // links to JDVersion of changeType STATUS_CHANGE
+  fromStage          String?
+  toStage            String   // "DRAFT" | "MANAGER_VALIDATION" | "HR_REVIEW" | "GOVERNANCE_APPROVAL" | "APPROVED" | "PUBLISHED" | "REJECTED" | "ARCHIVED"
+  action             String   // "ADVANCE" | "APPROVE" | "REJECT" | "REQUEST_CHANGES" | "DELEGATE" | "COMMENT" | "WITHDRAW" | "RESUBMIT"
+  actorId            String
+  comment            String?
+  isMandatoryComment Boolean  @default(false)
+  delegatedToUserId  String?
+  policyVersion      String?
+  createdAt          DateTime @default(now())
+
+  @@index([jdId, createdAt])
+  @@index([jdVersionId])
+  @@index([toStage])
+  @@map("approval_records")
+}
+
+// ── Companion Request Log (Phase 3) ──────────────────────────────────────────
+//
+// Stores saved AI Companion exchanges so users can retrieve past analyses,
+// draft outputs, and task lists without relying on session storage.
+
+model CompanionRequest {
+  id        String   @id @default(uuid())
+  userId    String
+  orgId     String?
+  prompt    String   @db.Text // user's message
+  reply     String   @db.Text // companion's response
+  context   Json     @default("{}") // pathname, selectedJD, locale etc.
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([orgId])
+  @@map("companion_requests")
+}
+
+// ── Intake Session + Project Readiness (Phase 3 use; Phase 1 schema only) ────
+
+model IntakeSession {
+  id        String   @id @default(uuid())
+  orgId     String
+  answers   Json     // { itemId: { answer, note } }
+  status    String   @default("OPEN") // "OPEN" | "SUBMITTED"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdById String?
+
+  @@index([orgId, createdAt])
+  @@map("intake_sessions")
+}
+
+model ReadinessScore {
+  id        String   @id @default(uuid())
+  orgId     String
+  jdId      String?
+  scores    Json     // { dimensionId: number }
+  totalScore Int
+  status    String   // "READY" | "CONDITIONAL" | "NOT_READY"
+  fastFails Json     // string[]
+  createdAt DateTime @default(now())
+  createdById String?
+
+  @@index([orgId, createdAt])
+  @@index([jdId])
+  @@map("readiness_scores")
+}
+
+// ── Sources Intelligence Engine ───────────────────────────────────────────────
+
+// One row per configured source (Greenhouse board, Ashby org, Adzuna search, etc.)
+model SourceConnection {
+  id               String   @id @default(uuid())
+  orgId            String
+  sourceName       String   // human label e.g. "Acme Greenhouse Board"
+  sourceKind       String   // GREENHOUSE_API | ASHBY_POSTING_API | ADZUNA_API | SCHEMA_ORG | GENERIC_HTML | MANUAL_URL | ...
+  config           Json     @default("{}") // { boardToken, country, query, connectorId, ... }
+  status           String   @default("ACTIVE") // ACTIVE | PAUSED | ERROR
+  permissionStatus String   @default("UNKNOWN") // UNKNOWN | ROBOTS_OK | BLOCKED | API_OK
+  lastRunAt        DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  runs     SourceRun[]
+  postings ImportedJobPosting[]
+
+  @@index([orgId, status])
+  @@map("source_connections")
+}
+
+// One row per ingestion run triggered for a SourceConnection
+model SourceRun {
+  id                 String   @id @default(uuid())
+  sourceConnectionId String
+  orgId              String
+  status             String   @default("running") // running | completed | failed | partial
+  startedAt          DateTime @default(now())
+  finishedAt         DateTime?
+  jobsDiscovered     Int      @default(0)
+  jobsFetched        Int      @default(0)
+  jobsImported       Int      @default(0)
+  jobsFailed         Int      @default(0)
+  diagnosticsJson    Json?
+
+  sourceConnection SourceConnection     @relation(fields: [sourceConnectionId], references: [id], onDelete: Cascade)
+  postings         ImportedJobPosting[]
+  snapshots        RawSourceSnapshot[]
+
+  @@index([sourceConnectionId, startedAt])
+  @@index([orgId, startedAt])
+  @@map("source_runs")
+}
+
+// Normalised job posting imported from any source (pre-approval, not yet in JD Hub)
+model ImportedJobPosting {
+  id                 String   @id @default(uuid())
+  orgId              String
+  sourceConnectionId String?
+  sourceRunId        String?
+  externalId         String?  // ID from the source ATS/board
+  canonicalUrl       String?
+  sourceUrl          String?
+  companyName        String?
+  title              String
+  normalizedTitle    String?
+  department         String?
+  team               String?
+  jobFamily          String?
+  jobLevel           String?
+  location           String?
+  country            String?
+  workingModel       String?  // Remote | Hybrid | On-site
+  employmentType     String?
+  salaryMin          Decimal? @db.Decimal(12, 2)
+  salaryMax          Decimal? @db.Decimal(12, 2)
+  salaryCurrency     String?
+  salaryPeriod       String?  // YEAR | MONTH | HOUR
+  datePosted         DateTime?
+  dateFirstSeen      DateTime @default(now())
+  descriptionRaw     String?  @db.Text
+  descriptionClean   String?  @db.Text
+  contentHash        String?  // SHA-256 of url+title+description for dedup
+  sourceKind         String?
+  confidenceScore    Int?
+  diagnosticsJson    Json?
+  linkedJdId         String?  // set when user saves posting to JD Hub
+  reviewStatus       String   @default("PENDING") // PENDING | APPROVED | REJECTED | SAVED
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  sourceConnection   SourceConnection?       @relation(fields: [sourceConnectionId], references: [id], onDelete: SetNull)
+  sourceRun          SourceRun?              @relation(fields: [sourceRunId], references: [id], onDelete: SetNull)
+  linkedJd           JobDescription?         @relation(fields: [linkedJdId], references: [id], onDelete: SetNull)
+  readinessRecord    JDEvaluationReadinessRecord?
+  extraContextItems  ExtraContextItem[]
+
+  @@unique([orgId, contentHash])  // prevents duplicate imports
+  @@index([orgId, reviewStatus, createdAt])
+  @@index([orgId, sourceKind])
+  @@index([sourceConnectionId])
+  @@map("imported_job_postings")
+}
+
+// JD Evaluation Readiness assessment (Claude-powered) per imported posting
+model JDEvaluationReadinessRecord {
+  id                          String   @id @default(uuid())
+  importedJobPostingId        String   @unique
+  orgId                       String
+  rolePurposeJson             Json?
+  topResponsibilitiesJson     Json?
+  decisionRightsJson          Json?
+  scopeOfImpactJson           Json?
+  reportingRelationshipsJson  Json?
+  criticalRequirementsJson    Json?
+  skillsEvidenceJson          Json?
+  missingEvidenceJson         Json?
+  ambiguityFlagsJson          Json?
+  recruitmentCopyWarning      Boolean  @default(false)
+  evaluationReadinessScore    Int?     // 0-100
+  confidenceScore             Int?
+  recommendedQuestionsJson    Json?
+  recommendedImprovementsJson Json?
+  createdAt                   DateTime @default(now())
+
+  posting ImportedJobPosting @relation(fields: [importedJobPostingId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, evaluationReadinessScore])
+  @@map("jd_evaluation_readiness_records")
+}
+
+// Raw HTML/JSON snapshot of each fetched URL (for audit trail + re-parsing)
+model RawSourceSnapshot {
+  id            String   @id @default(uuid())
+  orgId         String
+  sourceRunId   String?
+  url           String
+  externalId    String?
+  contentHash   String?
+  rawHtml       String?  @db.Text
+  rawJson       Json?
+  fetchedAt     DateTime @default(now())
+  headersJson   Json?
+  parserVersion String   @default("1.0")
+
+  sourceRun SourceRun? @relation(fields: [sourceRunId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, fetchedAt])
+  @@index([sourceRunId])
+  @@index([contentHash])
+  @@map("raw_source_snapshots")
+}
+
+// Org structure inference run — one per discover run
+model OrgInferenceRun {
+  id                    String   @id @default(uuid())
+  orgId                 String
+  sourceRunId           String?
+  status                String   @default("COMPLETE") // RUNNING | COMPLETE | FAILED
+  createdAt             DateTime @default(now())
+  disclaimer            String   @db.Text
+  graphJson             Json?    // full OrgInferenceResult JSON
+  confidenceSummary     Json?    // { avgNodeConfidence, departments, teams, roles }
+  unresolvedSignalsJson Json?
+  conflictsJson         Json?
+
+  nodes OrgNode[]
+  edges OrgEdge[]
+
+  @@index([orgId, createdAt])
+  @@map("org_inference_runs")
+}
+
+// Org graph node (department, team, role, location, etc.)
+model OrgNode {
+  id              String   @id @default(uuid())
+  orgInferenceRunId String
+  type            String   // company | department | subDepartment | team | jobFamily | role | location
+  label           String
+  normalizedLabel String
+  confidence      Int      // 0-100
+  evidenceJson    Json     // string[]
+  sourceUrlsJson  Json     // string[]
+  jobCount        Int      @default(1)
+  createdAt       DateTime @default(now())
+
+  run        OrgInferenceRun @relation(fields: [orgInferenceRunId], references: [id], onDelete: Cascade)
+  fromEdges  OrgEdge[]       @relation("EdgeFrom")
+  toEdges    OrgEdge[]       @relation("EdgeTo")
+
+  @@index([orgInferenceRunId, type])
+  @@index([normalizedLabel])
+  @@map("org_nodes")
+}
+
+// Org graph edge (contains, reports_to, co_located, peer)
+model OrgEdge {
+  id                String   @id @default(uuid())
+  orgInferenceRunId String
+  fromNodeId        String
+  toNodeId          String
+  relationshipType  String   // contains | reports_to | co_located | peer
+  confidence        Int      // 0-100
+  evidenceJson      Json     // string[]
+  createdAt         DateTime @default(now())
+
+  run      OrgInferenceRun @relation(fields: [orgInferenceRunId], references: [id], onDelete: Cascade)
+  fromNode OrgNode         @relation("EdgeFrom", fields: [fromNodeId], references: [id], onDelete: Cascade)
+  toNode   OrgNode         @relation("EdgeTo", fields: [toNodeId], references: [id], onDelete: Cascade)
+
+  @@index([orgInferenceRunId])
+  @@index([fromNodeId])
+  @@index([toNodeId])
+  @@map("org_edges")
+}
+
+// Extra context item attached to an imported posting (annual reports, press, news)
+model ExtraContextItem {
+  id                      String   @id @default(uuid())
+  orgId                   String
+  importedJobPostingId    String?
+  sourceType              String   // website | ir | news | annual_report | press_release | blog | upload
+  title                   String
+  url                     String?
+  publishedAt             DateTime?
+  summary                 String   @db.Text
+  relevanceToJd           String?  @db.Text
+  reliabilityScore        Int?     // 0-100
+  riskLevel               String   @default("LOW") // LOW | MEDIUM | HIGH
+  recommendation          String   @default("KEEP_AS_CONTEXT") // INCLUDE | KEEP_AS_CONTEXT | IGNORE
+  userDecision            String?  // APPROVED | REJECTED | PENDING
+  createdAt               DateTime @default(now())
+
+  posting ImportedJobPosting? @relation(fields: [importedJobPostingId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, importedJobPostingId])
+  @@index([orgId, createdAt])
+  @@map("extra_context_items")
+}
